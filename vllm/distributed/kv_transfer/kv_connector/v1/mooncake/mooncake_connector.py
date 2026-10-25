@@ -660,6 +660,9 @@ class MooncakeXferResponse(
     ok_reqs: list[ReqId] | None = None
     err_reqs: list[ReqId] | None = None
     err_msg: str | None = None
+    # Pulls whose KV P released for a cache reset: D recomputes them whatever
+    # its kv_load_failure_policy, since nothing failed.
+    released_reqs: list[ReqId] | None = None
     # The pull's layout_id once P holds that layout. D omits the layout only
     # after seeing it, so a P that predates this field always gets it.
     layout_id: int = 0
@@ -699,6 +702,8 @@ class SendBlockMeta:
     ready: asyncio.Event
     expire_time: float = float("inf")
     state: SendState = SendState.WAITING
+    # Ended because a cache reset released its KV, not because P failed it.
+    released: bool = False
     need_send: int = 0
     sent: int = 0
     sending: int = 0
@@ -1415,6 +1420,8 @@ class MooncakeConnectorWorker:
         # Block IDs are only unique within a group, so with multiple groups
         # load failures are reported per request instead.
         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+        # Loads whose KV P released (e.g. for a cache reset): always recomputed.
+        self._recompute_recv_reqs: queue.Queue[ReqId] = queue.Queue()
 
         self.xfer_stats = MooncakeKVConnectorStats()
 
@@ -1749,12 +1756,14 @@ class MooncakeConnectorWorker:
             live = [pull for pull in woken if pull[1].state is not SendState.DONE]
             if len(live) < len(woken):
                 # Answered before the writes, which may wait for a sender.
+                ended = [(d, m) for d, m in woken if m.state is SendState.DONE]
                 response = MooncakeXferResponse(
                     status=MooncakeXferResponseStatus.CONTINUE
                     if live or wait_tasks
                     else MooncakeXferResponseStatus.FINISH,
-                    err_reqs=[d for d, m in woken if m.state is SendState.DONE],
+                    err_reqs=[d for d, m in ended if not m.released] or None,
                     err_msg="Aborted on the P side",
+                    released_reqs=[d for d, m in ended if m.released] or None,
                 )
                 await sock.send_multipart((identity, self._encoder.encode(response)))
             if not live:
@@ -1762,11 +1771,13 @@ class MooncakeConnectorWorker:
             ok_reqs, err_reqs, err_msg = await self._write_pulls(
                 live, deadline, meta, remote_tp_ranks, local_regions, remote_regions
             )
+            released = {d for d, m in live if m.released}
             response = MooncakeXferResponse(
                 status=response_status,
                 ok_reqs=ok_reqs or None,
-                err_reqs=err_reqs or None,
+                err_reqs=[d for d in err_reqs if d not in released] or None,
                 err_msg=err_msg,
+                released_reqs=[d for d in err_reqs if d in released] or None,
                 layout_id=meta.layout_id,
             )
             await sock.send_multipart((identity, self._encoder.encode(response)))
@@ -2554,17 +2565,19 @@ class MooncakeConnectorWorker:
         """
         finished_sending_reqs, finished_recving_reqs = self.get_finished()
 
-        failed_recving_reqs: set[ReqId] = set()
-        while True:
-            try:
-                failed_recving_reqs.add(self._failed_recv_reqs.get_nowait())
-            except queue.Empty:
-                break
+        def drain(reqs: queue.Queue[ReqId]) -> set[ReqId]:
+            drained: set[ReqId] = set()
+            while True:
+                try:
+                    drained.add(reqs.get_nowait())
+                except queue.Empty:
+                    return drained
 
         return KVConnectorTransferResults(
             finished_sending=set(finished_sending_reqs or ()),
             finished_recving=set(finished_recving_reqs or ()),
-            failed_recving=failed_recving_reqs,
+            failed_recving=drain(self._failed_recv_reqs),
+            recompute_recving=drain(self._recompute_recv_reqs),
         )
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
@@ -2662,8 +2675,10 @@ class MooncakeConnectorWorker:
         pull_metas: dict[ReqId, PullReqMeta],
         req_ids: Collection[ReqId],
         reason: str,
+        recompute: bool = False,
     ) -> None:
-        """Report a failed remote KV load so the scheduler can fail or recompute it."""
+        """Report a failed remote KV load so the scheduler can fail or recompute
+        it; with recompute, it recomputes whatever the failure policy says."""
         failed: list[ReqId] = []
         for req_id in req_ids:
             pull_meta = pull_metas.pop(req_id, None)
@@ -2686,7 +2701,9 @@ class MooncakeConnectorWorker:
                 # the scheduler's `assert req_id in self.requests`.
                 self._complete_pull_task(pull_meta)
                 continue
-            if self._is_hma_required:
+            if recompute:
+                self._recompute_recv_reqs.put(pull_meta.d_req_id)
+            elif self._is_hma_required:
                 self._failed_recv_reqs.put(pull_meta.d_req_id)
             else:
                 self._invalid_block_ids.put(invalid)
@@ -2717,6 +2734,13 @@ class MooncakeConnectorWorker:
         response: MooncakeXferResponse,
         pull_metas: dict[ReqId, PullReqMeta],
     ):
+        if response.released_reqs:
+            self._handle_failed_recv(
+                pull_metas,
+                response.released_reqs,
+                "KV released on the P side",
+                recompute=True,
+            )
         if response.err_reqs:
             self._handle_failed_recv(
                 pull_metas, response.err_reqs, response.err_msg or "unknown error"
@@ -2881,6 +2905,7 @@ class MooncakeConnectorWorker:
             # Only finished requests' KV; P still owns its unfinished ones.
             for send_meta in self.reqs_need_send.values():
                 if send_meta.state is SendState.READY:
+                    send_meta.released = True
                     self._end_send(send_meta)
 
     def _end_send(self, send_meta: SendBlockMeta) -> None:

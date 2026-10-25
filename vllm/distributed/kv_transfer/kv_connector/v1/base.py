@@ -96,6 +96,9 @@ class KVConnectorTransferResults:
     finished_sending: set[str] = field(default_factory=set)
     finished_recving: set[str] = field(default_factory=set)
     failed_recving: set[str] = field(default_factory=set)
+    # Failed receives recomputed whatever kv_load_failure_policy says: the
+    # producer released the KV (e.g. for a cache reset); nothing failed.
+    recompute_recving: set[str] = field(default_factory=set)
 
 
 class SupportsHMA(ABC):

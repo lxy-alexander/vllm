@@ -1810,6 +1810,42 @@ async def test_expired_peer_finish_settles_pending_receive(first_peer_succeeds):
             worker.shutdown()
 
 
+def test_released_pull_reports_forced_recompute():
+    """A pull whose KV P released for a cache reset ends the load as one to
+    recompute, not as a failure subject to kv_load_failure_policy."""
+    with mooncake_register_worker(_make_test_kv_cache_config()) as (worker, _):
+        try:
+            meta = PullReqMeta(
+                d_req_id="d-req-1",
+                transfer_id="xfer-req-1",
+                local_block_ids=[[100]],
+                remote_engine_id="p-engine",
+                remote_bootstrap_addr="http://bootstrap:33333",
+                pull_tasks_count=1,
+            )
+            worker.process_pulling_result(
+                MooncakeXferResponse(
+                    status=MooncakeXferResponseStatus.FINISH,
+                    released_reqs=[meta.d_req_id],
+                ),
+                {meta.d_req_id: meta},
+            )
+            assert worker.finished_recving_reqs == {meta.d_req_id}
+            # No live loops here: hand over the finished set directly.
+            with patch.object(
+                worker,
+                "get_finished",
+                return_value=(None, set(worker.finished_recving_reqs)),
+            ):
+                results = worker.get_transfer_results()
+            assert results.finished_recving == {meta.d_req_id}
+            assert results.recompute_recving == {meta.d_req_id}
+            assert not results.failed_recving
+            assert not worker.get_block_ids_with_load_errors()
+        finally:
+            worker.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_kv_consumuer(monkeypatch):
     """Simulates a Consumer Worker (Decoder) initiating a pull from a Producer.
@@ -1901,6 +1937,7 @@ async def test_kv_consumuer(monkeypatch):
         (["claim", "ready", "failing-pull"], None, True),
         (["claim", "ready", "abort-all"], None, True),
         (["claim", "pull", "abort-all"], None, False),
+        (["claim", "ready", "abort-all", "pull"], "released", True),
         (["claim", "ready", "busy", "pull", "abort", "free"], False, True),
         (["claim", "ready", "busy", "abort", "pull"], False, True),
         (["claim", "abort", "neighbor", "busy", "pull"], False, False),
@@ -1931,6 +1968,7 @@ async def test_kv_consumuer(monkeypatch):
         "failed-send-frees-kv",
         "abort-all-frees-ready-kv",
         "abort-all-spares-unfinished",
+        "pull-after-reset-is-released",
         "pull-waiting-for-a-sender-stays-abortable",
         "aborted-pull-answered-while-senders-are-busy",
         "aborted-pull-answered-before-its-batch-writes",
@@ -2048,7 +2086,10 @@ async def test_send_state_answers_every_pull_once(monkeypatch, events, pull_ok, 
             for call in sock.send_multipart.call_args_list
         )
         responses = [
-            r for r in decoded if "d-req" in (r.ok_reqs or []) + (r.err_reqs or [])
+            r
+            for r in decoded
+            if "d-req"
+            in (r.ok_reqs or []) + (r.err_reqs or []) + (r.released_reqs or [])
         ]
         if pull_ok is None:
             assert not responses
@@ -2062,8 +2103,18 @@ async def test_send_state_answers_every_pull_once(monkeypatch, events, pull_ok, 
                 if "neighbor" in events
                 else MooncakeXferResponseStatus.FINISH
             )
-            ok, err = (["d-req"], None) if pull_ok else (None, ["d-req"])
-            assert (responses[0].ok_reqs, responses[0].err_reqs) == (ok, err)
+            # KV a cache reset released is reported apart from failures.
+            expected = {
+                True: (["d-req"], None, None),
+                False: (None, ["d-req"], None),
+                "released": (None, None, ["d-req"]),
+            }[pull_ok]
+            response = responses[0]
+            assert (
+                response.ok_reqs,
+                response.err_reqs,
+                response.released_reqs,
+            ) == expected
         assert freed_reqs == ({"p-req"} if freed else set())
         if pull is not None:
             pull.cancel()

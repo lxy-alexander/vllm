@@ -2251,6 +2251,10 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats: SpecDecodingStats | None = None
 
         failed_kv_load_req_ids: set[str] = set()
+        if kv_connector_output and kv_connector_output.recompute_recving:
+            self._handle_failed_recving(
+                kv_connector_output.recompute_recving, recompute=True
+            )
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
                 self._handle_failed_recving(kv_connector_output.failed_recving)
@@ -3595,8 +3599,13 @@ class Scheduler(SchedulerInterface):
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
-    def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
-        """Fail closed for layouts whose block IDs are not globally unique."""
+    def _handle_failed_recving(
+        self, failed_req_ids: set[str], recompute: bool | None = None
+    ) -> set[str]:
+        """Fail closed for layouts whose block IDs are not globally unique.
+        recompute overrides kv_load_failure_policy; returns the ids to fail."""
+        if recompute is None:
+            recompute = self.recompute_kv_load_failures
         affected_req_ids: set[str] = set()
         for req_id in failed_req_ids:
             request = self.requests.get(req_id)
@@ -3606,10 +3615,10 @@ class Scheduler(SchedulerInterface):
                 and req_id not in self.failed_recving_kv_req_ids
             ):
                 affected_req_ids.add(req_id)
-                if self.recompute_kv_load_failures:
+                if recompute:
                     request.num_computed_tokens = 0
                     self.failed_recving_kv_req_ids.add(req_id)
-        return set() if self.recompute_kv_load_failures else affected_req_ids
+        return set() if recompute else affected_req_ids
 
     def _handle_invalid_blocks(
         self, invalid_block_ids: set[int], num_scheduled_tokens: dict[str, int]
