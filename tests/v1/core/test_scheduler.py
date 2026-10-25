@@ -3217,6 +3217,30 @@ def test_pause_new_ignores_streaming_session_waiting_for_input():
     assert scheduler.get_num_unfinished_requests() == 0
 
 
+def test_pause_new_drains_queued_prefills_for_remote_decode():
+    """A P/D decoder may already hold blocks and wait on a queued prefill's KV,
+    so a PAUSED_NEW drain must run that prefill; other queued requests stay
+    queued until resume."""
+    scheduler = create_scheduler()
+    prefill, plain = create_requests(
+        num_requests=2, num_tokens=8, max_tokens=1, req_ids=["prefill", "plain"]
+    )
+    prefill.kv_transfer_params = {"do_remote_decode": True}
+    scheduler.add_request(plain)
+    scheduler.add_request(prefill)
+
+    scheduler.set_pause_state(PauseState.PAUSED_NEW)
+    assert scheduler.get_num_unfinished_requests() == 1
+    output = scheduler.schedule()
+    assert set(output.num_scheduled_tokens) == {"prefill"}
+    scheduler.update_from_output(output, _runner_output(["prefill"]))
+
+    assert prefill.status == RequestStatus.FINISHED_LENGTH_CAPPED
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert list(scheduler.waiting) == [plain]
+    assert plain.status == RequestStatus.WAITING
+
+
 @pytest.mark.parametrize(
     ("load_modes", "expected_has_sync_loads"),
     [
