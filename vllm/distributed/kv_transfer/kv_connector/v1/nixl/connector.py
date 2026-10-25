@@ -62,6 +62,7 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
+    from vllm.config.kv_transfer import KVTransferConfig
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
         NixlBaseConnectorScheduler,
     )
