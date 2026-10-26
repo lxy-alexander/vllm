@@ -1032,13 +1032,24 @@ class Scheduler(SchedulerInterface):
                     step_skipped_waiting.appendleft(request_to_skip)
 
             while token_budget > 0:
-                # Requests holding KV blocks are always drained first, and are
-                # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
+                # Requests holding KV blocks are always drained first. Under
+                # PAUSED_NEW only they (e.g. async KV loads) and prefills for a
+                # remote decoder are admitted.
                 request_queue = self.kv_holding_waiting
-                if not request_queue and self._pause_state == PauseState.UNPAUSED:
+                if not request_queue and self._pause_state != PauseState.PAUSED_ALL:
                     request_queue = self.waiting
                 if not request_queue or input_budget <= draft_slots:
                     break
+                if (
+                    request_queue is self.waiting
+                    and self._pause_state == PauseState.PAUSED_NEW
+                    and not self._prefills_for_remote_decode(
+                        request_queue.peek_request()
+                    )
+                ):
+                    # Stays queued for the pause; not deferred by scheduling.
+                    step_skipped_waiting.appendleft(request_queue.pop_request())
+                    continue
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
@@ -2635,6 +2646,13 @@ class Scheduler(SchedulerInterface):
         )
 
     @staticmethod
+    def _prefills_for_remote_decode(request: Request) -> bool:
+        # A P/D prefill: the decoder may hold blocks and wait on its KV, so a
+        # wait pause finishes it rather than leaving the decoder waiting.
+        params = request.kv_transfer_params
+        return bool(params and params.get("do_remote_decode"))
+
+    @staticmethod
     def _holds_kv_blocks(request: Request) -> bool:
         # Whether a request currently has kv blocks allocated.
         # While always the case when status is WAITING_FOR_REMOTE_KVS
@@ -3025,8 +3043,12 @@ class Scheduler(SchedulerInterface):
             return 0
         num_running, num_waiting = self.get_request_counts()
         if self._pause_state == PauseState.PAUSED_NEW:
-            # Requests holding KV blocks still drain; queued ones stay queued.
-            num_waiting = len(self.kv_holding_waiting)
+            # Requests holding KV blocks still drain, and so do prefills a
+            # remote decoder may already be pulling; other queued ones stay
+            # queued.
+            num_waiting = len(self.kv_holding_waiting) + sum(
+                map(self._prefills_for_remote_decode, self.waiting)
+            )
         num_waiting -= self.num_waiting_for_streaming_input
         return num_waiting + num_running
 
