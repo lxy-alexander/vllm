@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pause while D holds the request but has not sent its pull to P."""
+"""Pause or sleep while D holds the request but has not sent its pull to P."""
 
 import pytest
 
@@ -16,6 +16,8 @@ from tests.entrypoints.rl.state_transitions.new.conftest import (
     matrix_params,
     metrics,
     run_matrix_case,
+    run_sleep_case,
+    sleep_matrix_params,
     wait_for,
 )
 
@@ -44,7 +46,15 @@ def _setup(driver: PDDriver) -> Stage:
 
 @pytest.mark.parametrize(
     ("target", "mode", "clear_cache"),
-    matrix_params("d_waiting_to_start", ("both", "D"), with_nc=True),
+    matrix_params("d_waiting_to_start"),
 )
 def test_pause_at_d_waiting_to_start(pd_urls, target, mode, clear_cache):
     run_matrix_case(pd_urls, target, mode, clear_cache, _setup)
+
+
+@pytest.mark.parametrize(
+    ("level", "mode", "target"),
+    sleep_matrix_params("d_waiting_to_start"),
+)
+def test_sleep_at_d_waiting_to_start(pd_sleep_urls, level, mode, target):
+    run_sleep_case(pd_sleep_urls, target, level, mode, _setup)

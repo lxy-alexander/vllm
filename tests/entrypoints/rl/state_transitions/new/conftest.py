@@ -22,7 +22,15 @@ from pathlib import Path
 import pytest
 import requests
 
-from tests.entrypoints.rl.conftest import MODEL_NAME, gen, is_paused, ok, resume
+from tests.entrypoints.rl.conftest import (
+    MODEL_NAME,
+    gen,
+    is_paused,
+    is_sleeping,
+    ok,
+    resume,
+    wake,
+)
 
 P_PORT = 8810
 D_PORT = 8811
@@ -35,10 +43,12 @@ P_PREFILL_CHUNK = 32
 MAX_MODEL_LEN = 8192
 MAX_NUM_SEQS = 32
 
-PAUSE_LIMIT_S = 60
-PAUSE_TIMEOUT_S = 90
+# A pause or sleep that works returns within seconds and R1 hangs for 480 s,
+# so a run can shorten these limits to give up on failures sooner.
+PAUSE_LIMIT_S = float(os.environ.get("PD_PAUSE_LIMIT_S", 60))
+PAUSE_TIMEOUT_S = float(os.environ.get("PD_PAUSE_TIMEOUT_S", 90))
 STAGE_TIMEOUT_S = 60
-DRAIN_TIMEOUT_S = 180
+DRAIN_TIMEOUT_S = float(os.environ.get("PD_DRAIN_TIMEOUT_S", 180))
 IDLE_TIMEOUT_S = 30
 PROBE_PROMPTS = [
     "The capital of France is",
@@ -82,8 +92,17 @@ def _wait_for_server(
     raise TimeoutError(f"server did not become ready: {url}")
 
 
+def case_log_dir() -> Path | None:
+    """This test's log directory under PD_TEST_LOG_DIR, or None when unset."""
+    log_dir = os.environ.get("PD_TEST_LOG_DIR")
+    if not log_dir:
+        return None
+    test = os.environ.get("PYTEST_CURRENT_TEST", "pd").split(" ")[0]
+    return Path(log_dir) / re.sub(r"[^\w.-]+", "_", test)
+
+
 @contextmanager
-def pd_stack():
+def pd_stack(sleep_mode: bool = False, log_dir: Path | None = None):
     for port in (P_PORT, D_PORT, BOOTSTRAP_PORT, PROXY_PORT):
         if not _free_port(port):
             raise RuntimeError(f"required test port is busy: {port}")
@@ -101,6 +120,8 @@ def pd_stack():
         "--enforce-eager",
         "--enable-prefix-caching",
     ]
+    if sleep_mode:
+        base_args.append("--enable-sleep-mode")
     p_config = json.dumps(
         {"kv_connector": "MooncakeConnector", "kv_role": "kv_producer"}
     )
@@ -111,15 +132,12 @@ def pd_stack():
     with contextlib.ExitStack() as logs:
 
         def _output(name: str):
-            """(stdout, stderr) for a server; kept per test under
-            PD_TEST_LOG_DIR when set, else discarded."""
-            log_dir = os.environ.get("PD_TEST_LOG_DIR")
-            if not log_dir:
+            """(stdout, stderr) for a server; kept under log_dir when set,
+            else discarded."""
+            if log_dir is None:
                 return subprocess.DEVNULL, logs.enter_context(tempfile.TemporaryFile())
-            test = os.environ.get("PYTEST_CURRENT_TEST", "pd").split(" ")[0]
-            case_dir = Path(log_dir) / re.sub(r"[^\w.-]+", "_", test)
-            case_dir.mkdir(parents=True, exist_ok=True)
-            return logs.enter_context(open(case_dir / f"{name}.log", "wb")), (
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return logs.enter_context(open(log_dir / f"{name}.log", "wb")), (
                 subprocess.STDOUT
             )
 
@@ -194,12 +212,113 @@ def pd_stack():
                     process.kill()
 
 
-# A fresh pair per test: a transfer stuck by one case (e.g. R1 holds D for
-# VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT) must not fail the cases after it.
+@dataclass
+class _Stack:
+    """A running P/D pair with its logs."""
+
+    sleep_mode: bool
+    urls: tuple[str, str, str]
+    log_dir: Path | None
+    close: Callable[[], None]
+    # Log sizes when the current case started; scan_logs reads past them.
+    log_offsets: dict[str, int] = field(default_factory=dict)
+
+    def mark_logs(self):
+        if self.log_dir is not None:
+            for name in ("prefill", "decode"):
+                path = self.log_dir / f"{name}.log"
+                self.log_offsets[name] = path.stat().st_size if path.exists() else 0
+
+
+# By default every case gets a fresh pair: a transfer stuck by one case (e.g.
+# R1 holds D for VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT) must not fail the cases
+# after it. PD_REUSE_STACK=1 keeps a pair across cases that pass and leave it
+# clean, and starts a fresh one after any failure.
+_REUSE_STACK = os.environ.get("PD_REUSE_STACK") == "1"
+# One pair at a time: they share the ports.
+_idle_stack: _Stack | None = None
+_current_stack: _Stack | None = None
+
+
+def _start_stack(sleep_mode: bool, log_dir: Path | None) -> _Stack:
+    stack = pd_stack(sleep_mode, log_dir)
+    urls = stack.__enter__()
+    return _Stack(sleep_mode, urls, log_dir, lambda: stack.__exit__(None, None, None))
+
+
+def _is_clean(urls: tuple[str, str, str]) -> bool:
+    """Both sides serve, run nothing, hold no transfer, and reset their cache."""
+    try:
+        for url in urls[:2]:
+            if requests.get(f"{url}/health", timeout=5).status_code != 200:
+                return False
+            if is_paused(url) or is_sleeping(url):
+                return False
+            values = metrics(url)
+            stages = ("waiting_to_start", "in_progress", "completed_waiting")
+            if num_requests(values) or any(kv_fetch(values, s) for s in stages):
+                return False
+            response = requests.post(
+                f"{url}/reset_prefix_cache", params={"reset_external": True}, timeout=30
+            )
+            if response.json() != {"success": True}:
+                return False
+    except (requests.RequestException, ValueError, KeyError):
+        return False
+    return True
+
+
+def _pd_fixture(request: pytest.FixtureRequest, sleep_mode: bool):
+    global _idle_stack, _current_stack
+    stack, _idle_stack = _idle_stack, None
+    if stack is not None and (
+        stack.sleep_mode != sleep_mode or not _is_clean(stack.urls)
+    ):
+        stack.close()
+        stack = None
+    if stack is None:
+        stack = _start_stack(sleep_mode, case_log_dir())
+    stack.mark_logs()
+    if stack.log_dir is not None:
+        request.node.user_properties.append(("pd_log_dir", str(stack.log_dir)))
+    _current_stack = stack
+    try:
+        yield stack.urls
+    finally:
+        _current_stack = None
+        report = getattr(request.node, "rep_call", None)
+        if _REUSE_STACK and report is not None and report.passed:
+            _idle_stack = stack
+        else:
+            stack.close()
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, f"rep_{report.when}", report)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    global _idle_stack
+    if _idle_stack is not None:
+        _idle_stack.close()
+        _idle_stack = None
+
+
 @pytest.fixture
-def pd_urls():
-    with pd_stack() as urls:
-        yield urls
+def pd_urls(request):
+    yield from _pd_fixture(request, sleep_mode=False)
+
+
+@pytest.fixture
+def pd_sleep_urls(request, tmp_path, monkeypatch):
+    """pd_urls with --enable-sleep-mode; logs are always kept, since the sleep
+    cases scan them for crashes a 200 response can hide."""
+    if not os.environ.get("PD_TEST_LOG_DIR"):
+        monkeypatch.setenv("PD_TEST_LOG_DIR", str(tmp_path))
+    yield from _pd_fixture(request, sleep_mode=True)
 
 
 _METRIC_RE = re.compile(r"^(vllm:[a-z_]+)\{([^}]*)\} (\S+)$", re.M)
@@ -245,19 +364,108 @@ def token_prompt(num_tokens: int) -> list[int]:
     return [1000 + next(_prompt_ids)] + [2000] * (num_tokens - 1)
 
 
-def timed_pause(
-    url: str, mode: str = "abort", clear_cache: bool = True
-) -> tuple[int | None, float]:
+def timed_post(url: str, path: str, **params) -> tuple[int | None, float]:
     start = time.monotonic()
     try:
         status = requests.post(
-            f"{url}/pause",
-            params={"mode": mode, "clear_cache": clear_cache},
-            timeout=PAUSE_TIMEOUT_S,
+            f"{url}{path}", params=params, timeout=PAUSE_TIMEOUT_S
         ).status_code
     except requests.RequestException:
         status = None
     return status, time.monotonic() - start
+
+
+def timed_pause(
+    url: str, mode: str = "abort", clear_cache: bool = True
+) -> tuple[int | None, float]:
+    return timed_post(url, "/pause", mode=mode, clear_cache=clear_cache)
+
+
+def reload_weights(url: str):
+    """Write the weights again after a level 2 sleep discarded them."""
+    requests.post(
+        f"{url}/collective_rpc", json={"method": "reload_weights"}, timeout=300
+    ).raise_for_status()
+
+
+@dataclass(frozen=True)
+class Control:
+    """The stop/start pair a case drives: pause/resume, or sleep/wake_up."""
+
+    name: str
+    # None for pause; the sleep level otherwise.
+    level: int | None = None
+
+    @property
+    def stop_path(self) -> str:
+        return "/pause" if self.level is None else "/sleep"
+
+    def stop(self, url: str, mode: str, clear_cache: bool):
+        if self.level is None:
+            return timed_pause(url, mode, clear_cache)
+        # A sleep clears the cache by its level, not by clear_cache.
+        return timed_post(url, "/sleep", level=self.level, mode=mode)
+
+    def stopped(self, url: str) -> bool:
+        return is_paused(url) if self.level is None else is_sleeping(url)
+
+    def start(self, url: str) -> int:
+        if self.level is None:
+            return resume(url)
+        # A level 0 sleep only paused scheduling.
+        status = wake(url, ["scheduling"] if self.level == 0 else None)
+        if status == 200 and self.level == 2:
+            reload_weights(url)
+        return status
+
+
+PAUSE = Control("pause")
+SLEEP1 = Control("sleep1", level=1)
+SLEEP2 = Control("sleep2", level=2)
+
+# Crashes a sleep can cause by freeing KV memory a transfer still uses. A
+# control call can still return 200 while one of these happens.
+FATAL_LOG_RE = re.compile(
+    r"illegal memory access|CUDA error|Segmentation fault|core dumped|"
+    r"EngineDeadError|EngineCore encountered a fatal error|"
+    r"Error in Mooncake sender thread",
+    re.I,
+)
+# Transfers that failed. Expected when one side aborts, so they are reported
+# but do not fail a case on their own.
+TRANSFER_ERROR_RE = re.compile(
+    r"Sending to \S+ failed|pulling kv_caches for .* failed", re.I
+)
+
+
+def scan_logs() -> tuple[list[str], int]:
+    """(fatal lines, transfer error count) in P's and D's logs since this
+    test started."""
+    stack = _current_stack
+    fatal: list[str] = []
+    transfer_errors = 0
+    if stack is None or stack.log_dir is None:
+        return fatal, transfer_errors
+    for name in ("prefill", "decode"):
+        path = stack.log_dir / f"{name}.log"
+        if not path.exists():
+            continue
+        with open(path, "rb") as f:
+            f.seek(stack.log_offsets.get(name, 0))
+            text = f.read().decode(errors="replace")
+        for line in text.splitlines():
+            if FATAL_LOG_RE.search(line):
+                fatal.append(f"{name}: {line.strip()[:200]}")
+            elif TRANSFER_ERROR_RE.search(line):
+                transfer_errors += 1
+    return fatal, transfer_errors
+
+
+def assert_logs_clean(record_property: Callable[[str, object], None] | None = None):
+    fatal, transfer_errors = scan_logs()
+    if record_property is not None:
+        record_property("transfer_errors", transfer_errors)
+    assert not fatal, f"fatal errors in logs: {fatal[:5]}"
 
 
 def probe_texts(proxy_url: str) -> list[str | None]:
@@ -272,14 +480,15 @@ def assert_pauses_ok(
     pauses: list[tuple[int | None, float]],
     context: str,
     names: tuple[str, ...] = ("P", "D"),
+    op: str = "/pause",
 ):
-    """Every /pause call returned 200 within PAUSE_LIMIT_S."""
+    """Every control call returned 200 within PAUSE_LIMIT_S."""
     failed = [
         f"{name} status {status} after {seconds:.1f}s"
         for name, (status, seconds) in zip(names, pauses)
         if status != 200 or seconds > PAUSE_LIMIT_S
     ]
-    assert not failed, f"/pause failed: {'; '.join(failed)}; {context}"
+    assert not failed, f"{op} failed: {'; '.join(failed)}; {context}"
 
 
 def join_all(threads: list[threading.Thread], timeout: float) -> int:
@@ -464,7 +673,7 @@ class PDDriver:
 
 
 # ---------------------------------------------------------------------------
-# Pause matrix: (P, D or both) x (abort, wait, keep) x (clear, nc) at a stage
+# Pause matrix: (P, D or both) x /pause's (mode, clear_cache) at a stage
 # ---------------------------------------------------------------------------
 
 STAGE_PROMPT_TOKENS = 4000
@@ -491,11 +700,13 @@ class Stage:
     late_decodes: list[PDRequest] = field(default_factory=list)
 
 
-def matrix_params(stage: str, targets: tuple[str, ...], with_nc: bool):
-    """Cells of the pause matrix that exercise `stage`.
+def matrix_params(stage: str):
+    """Every cell of the pause matrix at `stage`: /pause's mode and
+    clear_cache on each target.
 
-    nc only differs from clear while transfers hold KV blocks, so stages that
-    hold none run with clear_cache=True only.
+    No target or nc cell is left out: a keep pause queues requests instead of
+    rejecting them, so a late D half reaches a paused D, and P still holds KV
+    that a D which has not pulled yet will ask for.
     """
     return [
         pytest.param(
@@ -504,9 +715,9 @@ def matrix_params(stage: str, targets: tuple[str, ...], with_nc: bool):
             clear_cache,
             id=f"pause_{_CELLS[mode, clear_cache]}_{target}_{stage}",
         )
-        for target in targets
+        for target in ("both", "P", "D")
         for mode in ("abort", "wait", "keep")
-        for clear_cache in ((True, False) if with_nc else (True,))
+        for clear_cache in (True, False)
     ]
 
 
@@ -516,8 +727,10 @@ def run_matrix_case(
     mode: str,
     clear_cache: bool,
     setup: Callable[[PDDriver], Stage],
+    control: Control = PAUSE,
 ):
-    """Pause `target` at the stage `setup` reaches, resume, check recovery."""
+    """Stop `target` at the stage `setup` reaches (pause, or sleep with
+    `control`), start it again, check recovery."""
     prefill_url, decode_url, proxy_url = pd_urls
     reference = probe_texts(proxy_url)
     assert None not in reference, reference
@@ -531,12 +744,12 @@ def run_matrix_case(
     with ThreadPoolExecutor(max_workers=len(names)) as pool:
         try:
             futures = [
-                pool.submit(timed_pause, urls[name], mode, clear_cache)
+                pool.submit(control.stop, urls[name], mode, clear_cache)
                 for name in names
             ]
             wait_for(
                 lambda: all(
-                    future.done() or is_paused(urls[name])
+                    future.done() or control.stopped(urls[name])
                     for name, future in zip(names, futures)
                 ),
                 "pause state set on every target",
@@ -546,10 +759,13 @@ def run_matrix_case(
                 driver.decode(req, max_tokens=DECODE_TOKENS)
             pauses = [future.result() for future in futures]
         finally:
-            resumed = [resume(urls[name]) for name in names]
+            resumed = [control.start(urls[name]) for name in names]
 
     assert reached, "setup error: the stage was gone at pause time"
-    assert_pauses_ok(pauses, f"target {target}, mode {mode}", names)
+    if control.level is not None:
+        # A crash shows up as a timeout below; report its cause instead.
+        assert_logs_clean()
+    assert_pauses_ok(pauses, f"target {target}, mode {mode}", names, control.stop_path)
     assert resumed == [200] * len(names), resumed
 
     stuck = join_all(driver.threads(), DRAIN_TIMEOUT_S)
@@ -562,6 +778,49 @@ def run_matrix_case(
         assert all(end == "length" for end in ends), f"keep dropped requests: {ends}"
     elif mode == "wait":
         # wait finishes what reached D before the pause; later ones get a 503.
-        ends = [req.finish_reason for req in sent_before_pause]
+        # A sleep queues later ones instead, so all of them must finish.
+        waited = sent_before_pause if control.level is None else driver.requests
+        ends = [req.finish_reason for req in waited if req.decode_sent.is_set()]
         assert all(end == "length" for end in ends), f"wait dropped requests: {ends}"
     assert_idle_and_probes_match(prefill_url, decode_url, proxy_url, reference)
+    if control.level is not None:
+        assert_logs_clean()
+
+
+# ---------------------------------------------------------------------------
+# Sleep matrix: (P, D or both) x /sleep's (level, mode) at a stage
+# ---------------------------------------------------------------------------
+
+
+def sleep_matrix_params(stage: str):
+    """Every cell of the sleep matrix at `stage`: /sleep's level and mode on
+    each target.
+
+    Unlike the pause matrix, no target or level is left out. A sleep queues
+    requests instead of rejecting them, so a late D half reaches a sleeping D,
+    and level 0 still differs from pause nc in what it accepts meanwhile.
+    """
+    return [
+        pytest.param(level, mode, target, id=f"sleep{level}_{mode}_{target}_{stage}")
+        for target in ("both", "P", "D")
+        for level in (0, 1, 2)
+        for mode in ("abort", "wait", "keep")
+    ]
+
+
+def run_sleep_case(
+    pd_urls: tuple[str, str, str],
+    target: str,
+    level: int,
+    mode: str,
+    setup: Callable[[PDDriver], Stage],
+):
+    """Sleep `target` at the stage `setup` reaches, wake it, check recovery."""
+    run_matrix_case(
+        pd_urls,
+        target,
+        mode,
+        level >= 1,
+        setup,
+        control=Control(f"sleep{level}", level=level),
+    )

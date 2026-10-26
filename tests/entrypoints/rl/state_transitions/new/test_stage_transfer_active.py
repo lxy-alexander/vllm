@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pause while P sends the request's KV to D."""
+"""Pause or sleep while P sends the request's KV to D."""
 
 import pytest
 
@@ -12,6 +12,8 @@ from tests.entrypoints.rl.state_transitions.new.conftest import (
     Stage,
     matrix_params,
     run_matrix_case,
+    run_sleep_case,
+    sleep_matrix_params,
     wait_for,
 )
 
@@ -28,7 +30,15 @@ def _setup(driver: PDDriver) -> Stage:
 
 @pytest.mark.parametrize(
     ("target", "mode", "clear_cache"),
-    matrix_params("transfer_active", ("both", "P", "D"), with_nc=True),
+    matrix_params("transfer_active"),
 )
 def test_pause_at_transfer_active(pd_urls, target, mode, clear_cache):
     run_matrix_case(pd_urls, target, mode, clear_cache, _setup)
+
+
+@pytest.mark.parametrize(
+    ("level", "mode", "target"),
+    sleep_matrix_params("transfer_active"),
+)
+def test_sleep_at_transfer_active(pd_sleep_urls, level, mode, target):
+    run_sleep_case(pd_sleep_urls, target, level, mode, _setup)
