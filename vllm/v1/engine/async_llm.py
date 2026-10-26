@@ -1024,8 +1024,16 @@ class AsyncLLM(EngineClient):
         await asyncio.sleep(0.02)
 
     async def resume_generation(self) -> None:
-        """Resume generation after :meth:`pause_generation`."""
-        await self.engine_core.resume_scheduler_async()
+        """Resume generation after :meth:`pause_generation`.
+
+        Raises:
+            ValueError: The engine is sleeping; it stays paused until wake_up.
+
+        """
+        if not await self.engine_core.resume_scheduler_async():
+            raise ValueError(
+                "Cannot resume while the engine is sleeping; wake it up first."
+            )
 
     async def is_paused(self) -> bool:
         """Return whether the engine is currently paused."""

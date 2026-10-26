@@ -86,6 +86,11 @@ async def resume_generation(raw_request: Request) -> JSONResponse:
             content={"status": "resumed"},
             status_code=HTTPStatus.OK.value,
         )
+    except ValueError as err:
+        return JSONResponse(
+            content={"error": str(err)},
+            status_code=HTTPStatus.CONFLICT.value,
+        )
     except Exception as err:  # pragma: no cover - defensive
         logger.exception("Failed to resume generation")
         return JSONResponse(

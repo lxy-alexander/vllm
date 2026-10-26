@@ -1349,8 +1349,8 @@ class AsyncMPClient(MPClient):
     ) -> None:
         await self.call_utility_async("pause_generation", mode, clear_cache)
 
-    async def resume_scheduler_async(self) -> None:
-        await self.call_utility_async("resume_scheduler")
+    async def resume_scheduler_async(self) -> bool:
+        return await self.call_utility_async("resume_scheduler")
 
     async def is_scheduler_paused_async(self) -> bool:
         return await self.call_utility_consensus_async("is_scheduler_paused")

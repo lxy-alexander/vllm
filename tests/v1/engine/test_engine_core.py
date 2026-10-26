@@ -748,6 +748,7 @@ def _pausable_engine_core_proc() -> EngineCoreProc:
     """A bare EngineCoreProc holding just the state pause_scheduler touches."""
     core = object.__new__(EngineCoreProc)
     core.model_executor = MagicMock()
+    core.model_executor.is_sleeping = False
     core.scheduler = MagicMock()
     core.scheduler.has_requests.return_value = False
     core.batch_queue = None
@@ -937,6 +938,25 @@ def test_resume_cancels_a_pending_cache_reset():
     assert not core._idle_state_callbacks
     core.scheduler.release_transfer_kv.assert_not_called()
     core._reset_caches.assert_not_called()
+
+
+@pytest.mark.parametrize("wake_tags", [None, ["weights"]], ids=["asleep", "kv_asleep"])
+def test_resume_refused_while_asleep(wake_tags):
+    """Resume leaves a sleeping engine paused: requests scheduled then would
+    run on discarded weights or KV cache. A partial wake still sleeps."""
+    core = _pausable_engine_core_proc()
+    core.model_executor.is_sleeping = True
+    core.pause_generation(mode="abort", clear_cache=False)
+    core.scheduler.set_pause_state.reset_mock()
+
+    assert core.resume_scheduler() is False
+    core.scheduler.set_pause_state.assert_not_called()
+    assert core.reject_new_requests
+
+    core.model_executor.is_sleeping = False
+    assert core.resume_scheduler() is True
+    core.scheduler.set_pause_state.assert_called_once_with(PauseState.UNPAUSED)
+    assert not core.reject_new_requests
 
 
 def test_sleep_mode_refuses_unsupported_kv_connector_at_startup():

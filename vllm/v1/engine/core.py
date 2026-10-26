@@ -969,9 +969,17 @@ class EngineCore:
 
         return None
 
-    def resume_scheduler(self) -> None:
-        """Resume the scheduler and flush any requests queued while paused."""
+    def resume_scheduler(self) -> bool:
+        """Resume the scheduler and flush any requests queued while paused.
+
+        Returns False and stays paused while executor memory is asleep:
+        requests scheduled then would run on discarded weights or KV cache.
+        """
+        if self.model_executor.is_sleeping:
+            logger.warning("Not resuming: the engine is sleeping; wake it up first.")
+            return False
         self.scheduler.set_pause_state(PauseState.UNPAUSED)
+        return True
 
     def is_scheduler_paused(self) -> bool:
         """Return whether the scheduler is in any pause state."""
@@ -2212,13 +2220,15 @@ class EngineCoreProc(EngineCore):
     def _begin_pause(self) -> None:
         """Hook for engines that must agree on a pause before going idle."""
 
-    def resume_scheduler(self) -> None:
+    def resume_scheduler(self) -> bool:
+        if not super().resume_scheduler():
+            return False
         self.reject_new_requests = False
-        super().resume_scheduler()
         # Operations waiting within the pause end with it.
         callbacks, self._idle_state_callbacks = self._idle_state_callbacks, []
         for callback in callbacks:
             callback(self)
+        return True
 
     def _when_idle(
         self, fn: Callable[[], Any], release_transfer_kv: bool = False
@@ -2386,7 +2396,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
-    def resume_scheduler(self):
+    def resume_scheduler(self) -> bool:
         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
             raise RuntimeError(
                 "resume_scheduler called while pause is still in "
@@ -2395,9 +2405,10 @@ class DPEngineCoreProc(EngineCoreProc):
             )
         if self.engines_running:
             logger.debug("Resume called while engines are not paused, ignoring.")
-            return
+            return True
 
-        super().resume_scheduler()
+        if not super().resume_scheduler():
+            return False
         self.ignore_start_dp_wave = False
 
         # Barrier: wait for all DP ranks to have resumed (and cleared
@@ -2410,6 +2421,7 @@ class DPEngineCoreProc(EngineCoreProc):
 
         if has_global_unfinished:
             self.engines_running = True
+        return True
 
     def barrier(self):
         """Blocking barrier on the DP process group (test-only utility)."""
