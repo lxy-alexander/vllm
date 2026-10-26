@@ -959,6 +959,27 @@ def test_resume_refused_while_asleep(wake_tags):
     assert not core.reject_new_requests
 
 
+@pytest.mark.parametrize("level", [0, 1, 2])
+@pytest.mark.parametrize("mode", ["abort", "wait", "keep"])
+def test_sleep_schedules_nothing_once_paused(level, mode):
+    """Once a sleep's pause is done the scheduler is PAUSED_ALL, so not even
+    the P/D prefills a wait pause drains (PAUSED_NEW) run until wake_up."""
+    core = _pausable_engine_core_proc()
+    core._reset_caches = MagicMock()
+    states = []
+    core.scheduler.set_pause_state.side_effect = states.append
+
+    result = core.sleep(level=level, mode=mode)
+    if isinstance(result, Future):
+        result.result(timeout=0)
+
+    assert states[-1] == PauseState.PAUSED_ALL
+    if level >= 1:
+        core.model_executor.sleep.assert_called_once_with(level)
+    else:
+        core.model_executor.sleep.assert_not_called()
+
+
 def test_sleep_mode_refuses_unsupported_kv_connector_at_startup():
     """With sleep mode, an unsupported connector is refused by the config."""
     engine_args = EngineArgs(

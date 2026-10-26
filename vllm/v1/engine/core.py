@@ -1001,13 +1001,17 @@ class EngineCore:
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(mode=mode, clear_cache=clear_prefix_cache)
-        if level < 1:
-            return pause_future
 
-        # Level 1+: Delegate to executor for GPU memory management
-        model_executor = self.model_executor
+        def fall_asleep() -> None:
+            # Requests a sleep accepts wait for wake_up. PAUSED_NEW would still
+            # run queued P/D prefills, on memory the executor is about to free.
+            self.scheduler.set_pause_state(PauseState.PAUSED_ALL)
+            if level >= 1:
+                # Level 1+: Delegate to executor for GPU memory management
+                self.model_executor.sleep(level)
+
         if pause_future is None:
-            model_executor.sleep(level)
+            fall_asleep()
             return None
 
         future = Future[Any]()
@@ -1015,11 +1019,12 @@ class EngineCore:
         def pause_complete(f: Future):
             try:
                 f.result()  # propagate any exception
-                future.set_result(model_executor.sleep(level))
+                future.set_result(fall_asleep())
             except Exception as e:
                 future.set_exception(e)
 
-        logger.info("Waiting for in-flight requests to complete before sleeping...")
+        if level >= 1:
+            logger.info("Waiting for in-flight requests to complete before sleeping...")
         pause_future.add_done_callback(pause_complete)
         return future
 
